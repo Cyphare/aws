@@ -1,0 +1,61 @@
+﻿=== 1. Health Check (GET /) ===
+Request: GET https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/
+Status: 200 (expected 200)
+Response: {"service": "Serverless Inventory API", "storage": "Amazon S3", "status": "ok", "endpoints": ["POST /items", "GET /items", "GET /items/{id}", "PUT /items/{id}", "DELETE /items/{id}"]}
+
+=== 2. Initial List (GET /items) ===
+Request: GET https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Status: 200 (expected 200)
+Response: {"items": [], "count": 0}
+
+=== 3. Create Item 1 (POST /items) ===
+Request: POST https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Payload: {"name":"Oscilloscope Tektronix TBS1052C","stock":4,"location":"Lab A - Rack 2"}
+Status: 201 (expected 201)
+Response: {"itemId": "826a9e49-8ea6-4606-a1e5-d962b2e98ab1", "name": "Oscilloscope Tektronix TBS1052C", "stock": 4, "location": "Lab A - Rack 2"}
+
+=== 4. Create Item 2 (POST /items) ===
+Request: POST https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Payload: {"name":"Digital Multimeter Fluke 117","stock":10,"location":"Lab B - Cabinet 1"}
+Status: 201 (expected 201)
+Response: {"itemId": "650241ac-dcbd-4e17-b6e6-cb74607a1c5d", "name": "Digital Multimeter Fluke 117", "stock": 10, "location": "Lab B - Cabinet 1"}
+
+=== 5. Invalid Create Missing Name (POST /items -> 400) ===
+Request: POST https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Payload: {}
+Status: 400 (expected 400)
+Response: {"error": "Field 'name' is required and must be a non-empty string"}
+
+=== 6. List After Creates (GET /items) ===
+Request: GET https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Status: 200 (expected 200)
+Response: {"items": [{"itemId": "650241ac-dcbd-4e17-b6e6-cb74607a1c5d", "name": "Digital Multimeter Fluke 117", "stock": 10, "location": "Lab B - Cabinet 1"}, {"itemId": "826a9e49-8ea6-4606-a1e5-d962b2e98ab1", "name": "Oscilloscope Tektronix TBS1052C", "stock": 4, "location": "Lab A - Rack 2"}], "count": 2}
+
+=== 7. Update Item 1 (PUT /items/826a9e49-8ea6-4606-a1e5-d962b2e98ab1) ===
+Request: PUT https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items/826a9e49-8ea6-4606-a1e5-d962b2e98ab1
+Payload: {"stock":7,"location":"Lab A - Bench 5"}
+Status: 200 (expected 200)
+Response: {"itemId": "826a9e49-8ea6-4606-a1e5-d962b2e98ab1", "name": "Oscilloscope Tektronix TBS1052C", "stock": 7, "location": "Lab A - Bench 5"}
+
+=== 8. Update Nonexistent Item (PUT -> 404) ===
+Request: PUT https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items/nonexistent-id-000
+Payload: {"stock":1}
+Status: 404 (expected 404)
+Response: {"error": "Item not found", "itemId": "nonexistent-id-000"}
+
+=== 9. Delete Item 2 (DELETE /items/650241ac-dcbd-4e17-b6e6-cb74607a1c5d) ===
+Request: DELETE https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items/650241ac-dcbd-4e17-b6e6-cb74607a1c5d
+Status: 200 (expected 200)
+Response: {"deleted": true, "itemId": "650241ac-dcbd-4e17-b6e6-cb74607a1c5d"}
+
+=== 10. Delete Nonexistent Item (DELETE -> 404) ===
+Request: DELETE https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items/nonexistent-id-000
+Status: 404 (expected 404)
+Response: {"error": "Item not found", "itemId": "nonexistent-id-000"}
+
+=== 11. Final List Persistence Check (GET /items) ===
+Request: GET https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/items
+Status: 200 (expected 200)
+Response: {"items": [{"itemId": "826a9e49-8ea6-4606-a1e5-d962b2e98ab1", "name": "Oscilloscope Tektronix TBS1052C", "stock": 7, "location": "Lab A - Bench 5"}], "count": 1}
+
+ALL 11 LIVE API CHECKS PASSED.
