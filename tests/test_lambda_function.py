@@ -1,7 +1,7 @@
-"""Unit tests for the Serverless Inventory API Lambda handler."""
+"""Unit tests for the Serverless Inventory API Lambda handler (S3 backend)."""
 
 import base64
-from decimal import Decimal
+import io
 import json
 import os
 import sys
@@ -12,65 +12,59 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import lambda_function
 
 
-class FakeDynamoDBTable:
-    """In-memory mock of a boto3 DynamoDB Table supporting CRUD and conditions."""
+class FakeS3Client:
+    """In-memory mock of a boto3 S3 client supporting CRUD and list pagination."""
 
     def __init__(self, page_size: int = 100):
-        self.items: dict[str, dict] = {}
+        self.objects: dict[tuple[str, str], bytes] = {}
         self.page_size = page_size
 
-    def put_item(self, Item: dict) -> dict:
-        self.items[Item["itemId"]] = dict(Item)
+    def put_object(self, Bucket: str, Key: str, Body: bytes, ContentType: str = "") -> dict:
+        self.objects[(Bucket, Key)] = Body if isinstance(Body, bytes) else Body.encode("utf-8")
         return {}
 
-    def get_item(self, Key: dict) -> dict:
-        item = self.items.get(Key["itemId"])
-        return {"Item": dict(item)} if item is not None else {}
+    def get_object(self, Bucket: str, Key: str) -> dict:
+        data = self.objects.get((Bucket, Key))
+        if data is None:
+            raise lambda_function.ClientError(
+                {
+                    "Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "GetObject",
+            )
+        return {"Body": io.BytesIO(data)}
 
-    def scan(self, ExclusiveStartKey: dict | None = None) -> dict:
-        ordered_keys = sorted(self.items.keys())
-        start_idx = 0
-        if ExclusiveStartKey is not None:
-            start_idx = ordered_keys.index(ExclusiveStartKey["itemId"]) + 1
-        batch_keys = ordered_keys[start_idx : start_idx + self.page_size]
-        result = {"Items": [dict(self.items[k]) for k in batch_keys]}
-        if start_idx + self.page_size < len(ordered_keys):
-            result["LastEvaluatedKey"] = {"itemId": batch_keys[-1]}
-        return result
+    def head_object(self, Bucket: str, Key: str) -> dict:
+        if (Bucket, Key) not in self.objects:
+            raise lambda_function.ClientError(
+                {
+                    "Error": {"Code": "404", "Message": "Not Found"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "HeadObject",
+            )
+        return {"ContentLength": len(self.objects[(Bucket, Key)])}
 
-    def update_item(
-        self,
-        Key: dict,
-        UpdateExpression: str,
-        ExpressionAttributeNames: dict,
-        ExpressionAttributeValues: dict,
-        ConditionExpression: str = "",
-        ReturnValues: str = "NONE",
+    def delete_object(self, Bucket: str, Key: str) -> dict:
+        self.objects.pop((Bucket, Key), None)
+        return {}
+
+    def list_objects_v2(
+        self, Bucket: str, Prefix: str = "", ContinuationToken: str | None = None
     ) -> dict:
-        item_id = Key["itemId"]
-        if ConditionExpression == "attribute_exists(itemId)" and item_id not in self.items:
-            raise lambda_function.ClientError(
-                {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Not found"}},
-                "UpdateItem",
-            )
-        item = dict(self.items[item_id])
-        assignments = UpdateExpression.replace("SET ", "", 1).split(", ")
-        for assignment in assignments:
-            name_placeholder, value_placeholder = assignment.split(" = ")
-            attr_name = ExpressionAttributeNames[name_placeholder]
-            item[attr_name] = ExpressionAttributeValues[value_placeholder]
-        self.items[item_id] = item
-        return {"Attributes": dict(item)} if ReturnValues == "ALL_NEW" else {}
-
-    def delete_item(self, Key: dict, ConditionExpression: str = "") -> dict:
-        item_id = Key["itemId"]
-        if ConditionExpression == "attribute_exists(itemId)" and item_id not in self.items:
-            raise lambda_function.ClientError(
-                {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Not found"}},
-                "DeleteItem",
-            )
-        del self.items[item_id]
-        return {}
+        matching_keys = sorted(
+            key for (bkt, key) in self.objects if bkt == Bucket and key.startswith(Prefix)
+        )
+        start_idx = int(ContinuationToken) if ContinuationToken is not None else 0
+        batch = matching_keys[start_idx : start_idx + self.page_size]
+        result: dict = {
+            "Contents": [{"Key": key} for key in batch],
+            "IsTruncated": start_idx + self.page_size < len(matching_keys),
+        }
+        if result["IsTruncated"]:
+            result["NextContinuationToken"] = str(start_idx + self.page_size)
+        return result
 
 
 def make_event(method: str, path: str, body=None, base64_encoded: bool = False) -> dict:
@@ -87,10 +81,7 @@ def make_event(method: str, path: str, body=None, base64_encoded: bool = False) 
         "isBase64Encoded": base64_encoded,
     }
     if body is not None:
-        if isinstance(body, (dict, list)):
-            raw = json.dumps(body)
-        else:
-            raw = body
+        raw = json.dumps(body) if isinstance(body, (dict, list)) else body
         if base64_encoded:
             raw = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
         event["body"] = raw
@@ -99,18 +90,18 @@ def make_event(method: str, path: str, body=None, base64_encoded: bool = False) 
 
 class LambdaFunctionTestCase(unittest.TestCase):
     def setUp(self):
-        self.fake_table = FakeDynamoDBTable()
-        lambda_function._table_instance = self.fake_table
+        self.fake_s3 = FakeS3Client()
+        lambda_function._s3_client = self.fake_s3
 
     def tearDown(self):
-        lambda_function._table_instance = None
+        lambda_function._s3_client = None
 
     def test_health_root(self):
         res = lambda_function.lambda_handler(make_event("GET", "/"))
         self.assertEqual(res["statusCode"], 200)
         payload = json.loads(res["body"])
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["service"], "Serverless Inventory API")
+        self.assertEqual(payload["storage"], "Amazon S3")
 
     def test_options_cors_preflight(self):
         res = lambda_function.lambda_handler(make_event("OPTIONS", "/items"))
@@ -161,30 +152,39 @@ class LambdaFunctionTestCase(unittest.TestCase):
         )
         self.assertEqual(invalid_json_res["statusCode"], 400)
 
-    def test_list_items_empty_decimal_and_pagination(self):
+    def test_list_items_empty_and_pagination(self):
         res_empty = lambda_function.lambda_handler(make_event("GET", "/items"))
         self.assertEqual(res_empty["statusCode"], 200)
         self.assertEqual(json.loads(res_empty["body"]), {"items": [], "count": 0})
 
-        self.fake_table = FakeDynamoDBTable(page_size=1)
-        lambda_function._table_instance = self.fake_table
-        self.fake_table.put_item(
-            {"itemId": "id-1", "name": "Multimeter", "stock": Decimal("10"), "location": "Cab 1"}
+        self.fake_s3 = FakeS3Client(page_size=1)
+        lambda_function._s3_client = self.fake_s3
+        bucket = lambda_function.get_bucket_name()
+        self.fake_s3.put_object(
+            bucket,
+            "items/id-1.json",
+            json.dumps({"itemId": "id-1", "name": "Multimeter", "stock": 10, "location": "Cab 1"}).encode(),
         )
-        self.fake_table.put_item(
-            {"itemId": "id-2", "name": "Power Supply", "stock": Decimal("2"), "location": "Rack 3"}
+        self.fake_s3.put_object(
+            bucket,
+            "items/id-2.json",
+            json.dumps({"itemId": "id-2", "name": "Power Supply", "stock": 2, "location": "Rack 3"}).encode(),
         )
+        # Non-JSON prefix marker should be ignored
+        self.fake_s3.put_object(bucket, "items/", b"")
 
         res_list = lambda_function.lambda_handler(make_event("GET", "/items"))
         self.assertEqual(res_list["statusCode"], 200)
         body = json.loads(res_list["body"])
         self.assertEqual(body["count"], 2)
-        self.assertEqual(len(body["items"]), 2)
-        self.assertIsInstance(body["items"][0]["stock"], int)
+        self.assertEqual([item["itemId"] for item in body["items"]], ["id-1", "id-2"])
 
     def test_get_item_found_and_not_found(self):
-        self.fake_table.put_item(
-            {"itemId": "abc-123", "name": "Logic Analyzer", "stock": 3, "location": "Bench 2"}
+        bucket = lambda_function.get_bucket_name()
+        self.fake_s3.put_object(
+            bucket,
+            "items/abc-123.json",
+            json.dumps({"itemId": "abc-123", "name": "Logic Analyzer", "stock": 3, "location": "Bench 2"}).encode(),
         )
         ok_res = lambda_function.lambda_handler(make_event("GET", "/items/abc-123"))
         self.assertEqual(ok_res["statusCode"], 200)
@@ -234,9 +234,12 @@ class LambdaFunctionTestCase(unittest.TestCase):
         del_again = lambda_function.lambda_handler(make_event("DELETE", f"/items/{item_id}"))
         self.assertEqual(del_again["statusCode"], 404)
 
-    def test_unknown_route(self):
-        res = lambda_function.lambda_handler(make_event("GET", "/unknown"))
-        self.assertEqual(res["statusCode"], 404)
+    def test_path_traversal_and_unknown_route(self):
+        traversal_res = lambda_function.lambda_handler(make_event("GET", "/items/..secret"))
+        self.assertEqual(traversal_res["statusCode"], 400)
+
+        unknown_res = lambda_function.lambda_handler(make_event("GET", "/unknown"))
+        self.assertEqual(unknown_res["statusCode"], 404)
 
 
 if __name__ == "__main__":

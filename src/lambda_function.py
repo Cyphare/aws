@@ -1,7 +1,6 @@
-"""AWS Lambda handler for the Serverless Inventory API."""
+"""AWS Lambda handler for the Serverless Inventory API (Amazon S3 storage backend)."""
 
 import base64
-from decimal import Decimal
 import json
 import os
 from typing import Any
@@ -11,7 +10,7 @@ import uuid
 try:
     import boto3
     from botocore.exceptions import ClientError
-except ImportError:  # pragma: no cover - local unit tests inject a mock table
+except ImportError:  # pragma: no cover - local unit tests inject a mock client
     boto3 = None
 
     class ClientError(Exception):
@@ -23,42 +22,46 @@ except ImportError:  # pragma: no cover - local unit tests inject a mock table
             self.operation_name = operation_name
 
 
-TABLE_NAME = os.environ.get("TABLE_NAME", "InventoryItems")
+DEFAULT_BUCKET_NAME = "inventory-items-992382537395-us-east-1"
+DEFAULT_ITEMS_PREFIX = "items/"
 _CORS_HEADERS = {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
-_table_instance: Any = None
+_s3_client: Any = None
 
 
-class DecimalEncoder(json.JSONEncoder):
-    """Serialize DynamoDB Decimal values as int or float."""
-
-    def default(self, obj: Any) -> Any:
-        if isinstance(obj, Decimal):
-            return int(obj) if obj % 1 == 0 else float(obj)
-        return super().default(obj)
+def get_bucket_name() -> str:
+    """Return the configured S3 bucket name."""
+    return os.environ.get("BUCKET_NAME", DEFAULT_BUCKET_NAME)
 
 
-def get_table() -> Any:
-    """Return a cached DynamoDB Table resource for TABLE_NAME."""
-    global _table_instance
-    if _table_instance is None:
+def get_items_prefix() -> str:
+    """Return the normalized S3 key prefix ending with '/' if non-empty."""
+    prefix = os.environ.get("ITEMS_PREFIX", DEFAULT_ITEMS_PREFIX).lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+    return prefix
+
+
+def get_s3_client() -> Any:
+    """Return a cached boto3 S3 client."""
+    global _s3_client
+    if _s3_client is None:
         if boto3 is None:
-            raise RuntimeError("boto3 is required to connect to DynamoDB")
-        table_name = os.environ.get("TABLE_NAME", TABLE_NAME)
-        _table_instance = boto3.resource("dynamodb").Table(table_name)
-    return _table_instance
+            raise RuntimeError("boto3 is required to connect to Amazon S3")
+        _s3_client = boto3.client("s3")
+    return _s3_client
 
 
 def response(status_code: int, body: Any = None) -> dict[str, Any]:
-    """Build an HTTP Lambda/API Gateway v2.0 JSON response."""
+    """Build an HTTP Lambda Function URL / API Gateway v2.0 JSON response."""
     return {
         "statusCode": status_code,
         "headers": dict(_CORS_HEADERS),
-        "body": "" if body is None else json.dumps(body, cls=DecimalEncoder),
+        "body": "" if body is None else json.dumps(body),
     }
 
 
@@ -97,12 +100,39 @@ def _is_valid_non_negative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _is_conditional_failure(exc: ClientError) -> bool:
-    err = getattr(exc, "response", {}).get("Error", {})
-    return err.get("Code") == "ConditionalCheckFailedException"
+def _is_valid_item_id(item_id: str) -> bool:
+    return bool(item_id) and "/" not in item_id and "\\" not in item_id and ".." not in item_id
 
 
-def handle_create_item(event: dict[str, Any], table: Any) -> dict[str, Any]:
+def _item_key(item_id: str) -> str:
+    return f"{get_items_prefix()}{item_id}.json"
+
+
+def _is_not_found_error(exc: ClientError) -> bool:
+    resp = getattr(exc, "response", {}) or {}
+    code = str(resp.get("Error", {}).get("Code", ""))
+    status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in ("NoSuchKey", "404", "NotFound") or status == 404
+
+
+def _read_item_from_s3(s3: Any, bucket: str, key: str) -> dict[str, Any]:
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return json.loads(raw)
+
+
+def _write_item_to_s3(s3: Any, bucket: str, key: str, item: dict[str, Any]) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(item).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def handle_create_item(event: dict[str, Any], s3: Any, bucket: str) -> dict[str, Any]:
     """Handle POST /items."""
     data, err = parse_json_body(event)
     if err or data is None:
@@ -130,102 +160,109 @@ def handle_create_item(event: dict[str, Any], table: Any) -> dict[str, Any]:
         "stock": stock,
         "location": location.strip(),
     }
-    table.put_item(Item=item)
+    _write_item_to_s3(s3, bucket, _item_key(item["itemId"]), item)
     return response(201, item)
 
 
-def handle_list_items(table: Any) -> dict[str, Any]:
-    """Handle GET /items with full DynamoDB scan pagination."""
-    items: list[dict[str, Any]] = []
-    scan_kwargs: dict[str, Any] = {}
+def handle_list_items(s3: Any, bucket: str) -> dict[str, Any]:
+    """Handle GET /items with paginated S3 object listing."""
+    prefix = get_items_prefix()
+    keys: list[str] = []
+    list_kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+
     while True:
-        res = table.scan(**scan_kwargs)
-        items.extend(res.get("Items", []))
-        last_key = res.get("LastEvaluatedKey")
-        if not last_key:
+        res = s3.list_objects_v2(**list_kwargs)
+        for obj in res.get("Contents", []):
+            key = obj.get("Key", "")
+            if key.endswith(".json"):
+                keys.append(key)
+        if not res.get("IsTruncated"):
             break
-        scan_kwargs["ExclusiveStartKey"] = last_key
+        token = res.get("NextContinuationToken")
+        if not token:
+            break
+        list_kwargs["ContinuationToken"] = token
+
+    items: list[dict[str, Any]] = []
+    for key in sorted(keys):
+        try:
+            items.append(_read_item_from_s3(s3, bucket, key))
+        except ClientError as exc:
+            if _is_not_found_error(exc):
+                continue
+            raise
+
+    items.sort(key=lambda entry: str(entry.get("itemId", "")))
     return response(200, {"items": items, "count": len(items)})
 
 
-def handle_get_item(item_id: str, table: Any) -> dict[str, Any]:
+def handle_get_item(item_id: str, s3: Any, bucket: str) -> dict[str, Any]:
     """Handle GET /items/{id}."""
-    res = table.get_item(Key={"itemId": item_id})
-    item = res.get("Item")
-    if not item:
-        return response(404, {"error": "Item not found", "itemId": item_id})
+    try:
+        item = _read_item_from_s3(s3, bucket, _item_key(item_id))
+    except ClientError as exc:
+        if _is_not_found_error(exc):
+            return response(404, {"error": "Item not found", "itemId": item_id})
+        raise
     return response(200, item)
 
 
-def handle_update_item(item_id: str, event: dict[str, Any], table: Any) -> dict[str, Any]:
+def handle_update_item(item_id: str, event: dict[str, Any], s3: Any, bucket: str) -> dict[str, Any]:
     """Handle PUT /items/{id}."""
     data, err = parse_json_body(event)
     if err or data is None:
         return response(400, {"error": err})
 
-    expr_parts: list[str] = []
-    expr_names: dict[str, str] = {}
-    expr_values: dict[str, Any] = {}
+    updates: dict[str, Any] = {}
 
     if "name" in data:
         name = data["name"]
         if not isinstance(name, str) or not name.strip():
             return response(400, {"error": "Field 'name' must be a non-empty string"})
-        expr_parts.append("#name = :name")
-        expr_names["#name"] = "name"
-        expr_values[":name"] = name.strip()
+        updates["name"] = name.strip()
 
     if "stock" in data:
         stock = data["stock"]
         if not _is_valid_non_negative_int(stock):
             return response(400, {"error": "Field 'stock' must be a non-negative integer"})
-        expr_parts.append("#stock = :stock")
-        expr_names["#stock"] = "stock"
-        expr_values[":stock"] = stock
+        updates["stock"] = stock
 
     if "location" in data:
         location = data["location"]
         if not isinstance(location, str):
             return response(400, {"error": "Field 'location' must be a string"})
-        expr_parts.append("#location = :location")
-        expr_names["#location"] = "location"
-        expr_values[":location"] = location.strip()
+        updates["location"] = location.strip()
 
-    if not expr_parts:
+    if not updates:
         return response(
             400,
             {"error": "At least one updatable field ('name', 'stock', 'location') is required"},
         )
 
+    key = _item_key(item_id)
     try:
-        res = table.update_item(
-            Key={"itemId": item_id},
-            UpdateExpression="SET " + ", ".join(expr_parts),
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values,
-            ConditionExpression="attribute_exists(itemId)",
-            ReturnValues="ALL_NEW",
-        )
+        item = _read_item_from_s3(s3, bucket, key)
     except ClientError as exc:
-        if _is_conditional_failure(exc):
+        if _is_not_found_error(exc):
             return response(404, {"error": "Item not found", "itemId": item_id})
         raise
 
-    return response(200, res.get("Attributes", {}))
+    item.update(updates)
+    _write_item_to_s3(s3, bucket, key, item)
+    return response(200, item)
 
 
-def handle_delete_item(item_id: str, table: Any) -> dict[str, Any]:
+def handle_delete_item(item_id: str, s3: Any, bucket: str) -> dict[str, Any]:
     """Handle DELETE /items/{id}."""
+    key = _item_key(item_id)
     try:
-        table.delete_item(
-            Key={"itemId": item_id},
-            ConditionExpression="attribute_exists(itemId)",
-        )
+        s3.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        if _is_conditional_failure(exc):
+        if _is_not_found_error(exc):
             return response(404, {"error": "Item not found", "itemId": item_id})
         raise
 
+    s3.delete_object(Bucket=bucket, Key=key)
     return response(200, {"deleted": True, "itemId": item_id})
 
 
@@ -241,6 +278,7 @@ def lambda_handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]
             200,
             {
                 "service": "Serverless Inventory API",
+                "storage": "Amazon S3",
                 "status": "ok",
                 "endpoints": [
                     "POST /items",
@@ -252,23 +290,26 @@ def lambda_handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]
             },
         )
 
-    table = get_table()
+    s3 = get_s3_client()
+    bucket = get_bucket_name()
 
     if path == "/items":
         if method == "POST":
-            return handle_create_item(event, table)
+            return handle_create_item(event, s3, bucket)
         if method == "GET":
-            return handle_list_items(table)
+            return handle_list_items(s3, bucket)
 
     if path.startswith("/items/"):
         raw_id = path[len("/items/") :]
         if raw_id and "/" not in raw_id:
             item_id = unquote(raw_id)
+            if not _is_valid_item_id(item_id):
+                return response(400, {"error": "Invalid itemId"})
             if method == "GET":
-                return handle_get_item(item_id, table)
+                return handle_get_item(item_id, s3, bucket)
             if method == "PUT":
-                return handle_update_item(item_id, event, table)
+                return handle_update_item(item_id, event, s3, bucket)
             if method == "DELETE":
-                return handle_delete_item(item_id, table)
+                return handle_delete_item(item_id, s3, bucket)
 
     return response(404, {"error": "Route not found", "method": method, "path": path})
