@@ -1,0 +1,76 @@
+# Serverless Inventory API: Design Brief
+
+**Author:** Arnold Gavrael Bonardo Situmorang – `24/539797/TK/59872`  
+**Track:** Track C — Serverless (`us-east-1`, AWS Account `9923-8253-7395`)
+
+---
+
+## 1. Use Case
+
+The project is an inventory management API for equipment and supplies—for example, instruments and tools kept in a university laboratory. A user can create a new item, list all stored items, retrieve a single item by ID, update an item's stock count or storage location, and delete an item.
+
+---
+
+## 2. Chosen Track: Serverless & Rationale for Service Substitution
+
+This project follows **Track C: Serverless**. In a serverless architecture, AWS manages provisioning, OS patching, scaling, and server availability, while the developer provides only the application code and configuration. Billing is per request and execution duration rather than idle server uptime, which fits a low-traffic laboratory inventory API. Key trade-offs include less control over the host runtime, a 15-minute maximum Lambda execution timeout, and cold-start latency on the first request after an idle period.
+
+### Why Different Services Were Used (AWS Academy Sandbox Constraints)
+
+The original design targeted **API Gateway + AWS Lambda + Amazon DynamoDB**. During live provisioning in the **AWS Academy Cloud Foundations Sandbox** (`us-east-1`, Account `9923-8253-7395`, federated role `voclabs`), two required services were explicitly blocked by sandbox IAM policies:
+
+1. **API Gateway → Replaced with AWS Lambda Function URL**: Attempting to create an HTTP API in `us-east-1` failed with HTTP `403` (`Access denied to apigateway:PUT` on `arn:aws:apigateway:us-east-1::/apis` — *no identity-based policy allows the action*). Instead of API Gateway, the design uses a native **Lambda Function URL** (`AuthType: NONE`), which provides a managed public HTTPS endpoint (`*.lambda-url.us-east-1.on.aws`) and sends the exact same Payload Format 2.0 HTTP events to Lambda without requiring API Gateway permissions.
+2. **Amazon DynamoDB → Replaced with Amazon S3**: Attempting to create the `InventoryItems` table failed with HTTP `400` (`not authorized to perform: dynamodb:CreateTable` on `arn:aws:dynamodb:us-east-1:992382537395:table/InventoryItems` — *no identity-based policy allows the action*). To keep the architecture 100% serverless without switching to a VM-based database, **Amazon S3** (`inventory-items-992382537395-us-east-1`) replaces DynamoDB by storing each item as an individual JSON object at `items/{itemId}.json`. This preserves key-based lookup by `itemId`, zero server maintenance, and pay-per-use pricing. The trade-off compared to DynamoDB is higher list latency (`ListObjectsV2` + `GetObject` per item) and no built-in secondary indexes or conditional expression engine, which is acceptable for a small lab inventory.
+3. **Custom IAM Role Creation → Reused `LabRole`**: Because `iam:CreateRole` is unavailable in the sandbox, the Lambda function reuses the pre-provisioned **`LabRole`** (`arn:aws:iam::992382537395:role/LabRole`).
+
+---
+
+## 3. Architecture Diagram
+
+![Serverless Inventory API Architecture](architecture-diagram.png)
+
+---
+
+## 4. Components and Why Each Is Used
+
+| Component | What It Does | Why It Is Used |
+|---|---|---|
+| **Client** | `curl` or Postman sends HTTPS requests with JSON bodies. | Simple way to test all CRUD endpoints without building a front end. |
+| **Lambda Function URL** (`AuthType: NONE`) | Provides a public HTTPS URL (`https://rv2twgddlrfmlyge5ulx6sv7yq0nzuzt.lambda-url.us-east-1.on.aws/`) and invokes Lambda with HTTP method and path. | Lambda functions cannot be reached over public HTTPS directly without an HTTP trigger; replaces API Gateway because `apigateway:PUT` is denied in this sandbox. |
+| **AWS Lambda** (`inventory-handler`, Python 3.12) | Parses Payload Format 2.0 method and path, validates JSON payloads, and executes CRUD against S3 via `boto3`. | Serverless compute with zero OS management; one handler routes all CRUD endpoints cleanly. |
+| **Amazon S3** (`inventory-items-992382537395-us-east-1`) | Private object bucket storing each item as `items/{itemId}.json` with SSE-S3 encryption. | Replaces DynamoDB (`dynamodb:CreateTable` denied in sandbox) while keeping serverless, durable, per-key storage without managing a database server. |
+| **IAM Role** (`LabRole`) | Execution role (`arn:aws:iam::992382537395:role/LabRole`) attached to Lambda. | Grants Lambda permission to call Amazon S3 and write CloudWatch Logs in `us-east-1` (`iam:CreateRole` is restricted). |
+| **Amazon CloudWatch Logs** | Collects logs in `/aws/lambda/inventory-handler`. | Provides invocation tracing and error diagnostics. |
+
+---
+
+## 5. Data Entity
+
+One entity, **`Item`**, stored in bucket `inventory-items-992382537395-us-east-1` under key `items/{itemId}.json`. The Lambda function generates `itemId` as a UUID v4 string.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `itemId` | String | Unique item key (UUID v4 generated by Lambda; maps to S3 key `items/{itemId}.json`) |
+| `name` | String | Name of the item (required, non-empty string) |
+| `stock` | Number | Units in stock (non-negative integer; default = `0`) |
+| `location` | String | Where the item is kept (optional string; default = `""`) |
+
+---
+
+## 6. CRUD Endpoints
+
+Five routes expose full create, read, update, and delete operations over HTTPS. Invalid JSON or invalid fields return **`400 Bad Request`**, and unknown IDs or routes return **`404 Not Found`**.
+
+| Method | Path | CRUD Action | Success Response |
+|---|---|---|---|
+| `POST` | `/items` | Create | `201 Created` and the new item JSON |
+| `GET` | `/items` | Read (list all) | `200 OK` and `{"items": [...], "count": N}` |
+| `GET` | `/items/{id}` | Read (single item) | `200 OK` and the matching item JSON |
+| `PUT` | `/items/{id}` | Update | `200 OK` and the updated item JSON |
+| `DELETE` | `/items/{id}` | Delete | `200 OK` and `{"deleted": true, "itemId": "{id}"}` |
+
+---
+
+## 7. IAM and Security
+
+All traffic uses **HTTPS/TLS** via the Lambda Function URL endpoint. The S3 bucket has **Block all public access** enabled and uses **SSE-S3** server-side encryption, so clients can never access stored objects directly—only Lambda can read or write objects through **`LabRole`** without embedded static AWS keys. No VPC is needed because Lambda Function URL, Lambda, S3, and CloudWatch Logs are AWS-managed services communicating over AWS service endpoints in `us-east-1`. This version omits API authentication so anyone with the Function URL can invoke it; a production iteration in an unrestricted AWS account would restore **API Gateway + DynamoDB**, add an API authorizer (Cognito/JWT or IAM), and scope the execution role to the single table/bucket prefix.
